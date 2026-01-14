@@ -175,7 +175,7 @@ monitor/
 
 通过Web界面添加：
 ```
-名称: 百度搜索
+名称: 测试
 类型: HTTPS
 地址: https://www.baidu.com  # 支持完整URL
 端口: 443（自动检测）
@@ -239,7 +239,7 @@ MIT License
 **Made with ❤️**
 
 **项目完成日期**: 2025-01-11
-**版本**: v3.0
+**版本**: v0.1
 **状态**: ✅ 生产就绪
 
 **查看详细文档**: [DOCUMENTATION.md](DOCUMENTATION.md)
