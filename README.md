@@ -251,9 +251,6 @@ Apache License 2.0
 
 **Made with ❤️**
 
-**项目完成日期**: 2025-01-11
-**版本**: v0.1
-**状态**: ✅ 生产就绪
 
 **查看详细文档**: [DOCUMENTATION.md](DOCUMENTATION.md)
 
