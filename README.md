@@ -232,7 +232,7 @@ DNS服务器: 8.8.8.8  # 自定义DNS
 
 ## 📄 许可证
 
-MIT License
+Apache License 2.0
 
 ---
 
