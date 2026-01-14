@@ -8,10 +8,19 @@
 
 ## 🎉 功能完整的监控系统
 
+<br/>
+
+![GitHub commit activity](https://img.shields.io/github/commit-activity/m/EmptyZeroRain/ArrowGo)
+![GitHub last commit](https://img.shields.io/github/last-commit/EmptyZeroRain/ArrowGo)
+![GitHub stars](https://img.shields.io/github/stars/EmptyZeroRain/ArrowGo)
+![GitHub issues](https://img.shields.io/github/issues/EmptyZeroRain/ArrowGo)
+
+<br/>
+
 **多协议监控** | **Web管理界面** | **日志查询** | **智能告警**
 
 [![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?logo=go)](https://golang.org)
-[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)
 
 </div>
 
