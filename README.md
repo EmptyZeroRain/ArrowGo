@@ -45,13 +45,10 @@
 ### 安装运行
 
 ```bash
-# 1. 编译
-make build
-
-# 2. 运行
+# 1. 运行
 go run cmd/server/main.go
 
-# 3. 访问Web界面
+# 2. 访问Web界面
 open http://localhost:8080
 ```
 
