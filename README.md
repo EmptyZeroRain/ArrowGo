@@ -1,6 +1,6 @@
 <div align="center">
 
-# ArrowGo监控拨测系统 v0.1
+# ArrowGo监控拨测系统
 
 </div>
 
