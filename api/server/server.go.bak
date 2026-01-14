@@ -1,0 +1,1105 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"time"
+
+	"monitor/api/middleware"
+	"monitor/internal/alert"
+	"monitor/internal/config"
+	"monitor/internal/database"
+	"monitor/internal/elasticsearch"
+	"monitor/internal/models"
+	"monitor/internal/monitor"
+	"monitor/pkg/ipgeo"
+
+	"github.com/gin-gonic/gin"
+)
+
+type Server struct {
+	router         *gin.Engine
+	monitorService *monitor.Service
+	ipgeoService   *ipgeo.Service
+	es             *elasticsearch.Client
+	alertService   *alert.Service
+	configPath     string
+	config         *config.Config
+}
+
+func NewServer(monitorService *monitor.Service, esClient *elasticsearch.Client, configPath string, cfg *config.Config) *Server {
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.Default()
+
+	// Add timeout middleware
+	router.Use(func(c *gin.Context) {
+		// Set timeout for request processing (30 seconds)
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+		defer cancel()
+
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
+	})
+
+	server := &Server{
+		router:         router,
+		monitorService: monitorService,
+		ipgeoService:   ipgeo.NewService(),
+		es:             esClient,
+		alertService:   alert.NewService(),
+		configPath:     configPath,
+		config:         cfg,
+	}
+
+	server.setupRoutes()
+
+	return server
+}
+
+func (s *Server) setupRoutes() {
+	// Apply rate limiting to all API routes
+	api := s.router.Group("/api/v1")
+	api.Use(middleware.RateLimit())
+
+	{
+		// Monitor management - all using POST
+		api.POST("/monitor/add", s.addMonitor)
+		api.POST("/monitor/list", s.listMonitors)
+		api.POST("/monitor/get", s.getMonitor)
+		api.POST("/monitor/update", s.updateMonitor)
+		api.POST("/monitor/remove", s.removeMonitor)
+
+		// Monitor status - using POST
+		api.POST("/monitor/status/get", s.getMonitorStatus)
+		api.POST("/monitor/status/list", s.listMonitorStatus)
+
+		// Logs - using POST
+		api.POST("/logs/search", s.searchLogs)
+		api.POST("/logs/stats", s.getLogStats)
+
+		// IP Geolocation - using POST
+		api.POST("/ipgeo/query", s.queryIPGeo)
+
+		// DNS Providers - using POST
+		api.POST("/dns/provider/add", s.addDNSProvider)
+		api.POST("/dns/provider/list", s.listDNSProviders)
+		api.POST("/dns/provider/get", s.getDNSProvider)
+		api.POST("/dns/provider/update", s.updateDNSProvider)
+		api.POST("/dns/provider/remove", s.removeDNSProvider)
+
+		// Alert Channels - using POST
+		api.POST("/alert/channel/add", s.addAlertChannel)
+		api.POST("/alert/channel/list", s.listAlertChannels)
+		api.POST("/alert/channel/get", s.getAlertChannel)
+		api.POST("/alert/channel/update", s.updateAlertChannel)
+		api.POST("/alert/channel/remove", s.removeAlertChannel)
+		api.POST("/alert/channel/test", s.testAlertChannel)
+
+		// Alert Rules - using POST
+		api.POST("/alert/rule/add", s.addAlertRule)
+		api.POST("/alert/rule/list", s.listAlertRules)
+		api.POST("/alert/rule/get", s.getAlertRule)
+		api.POST("/alert/rule/update", s.updateAlertRule)
+		api.POST("/alert/rule/remove", s.removeAlertRule)
+		api.POST("/alert/rule/listByTarget", s.listAlertRulesByTarget)
+
+		// System Configuration
+		api.GET("/config", s.getConfig)
+		api.POST("/config", s.updateConfig)
+	}
+
+	s.router.GET("/health", s.healthCheck)
+
+	// Serve static files (no rate limiting for static content)
+	s.router.Static("/static", "./web/static")
+	s.router.LoadHTMLGlob("./web/templates/*")
+
+	// Frontend page
+	s.router.GET("/", s.indexPage)
+}
+
+// Common request/response types
+type IDRequest struct {
+	ID uint32 `json:"id" binding:"required"`
+}
+
+type AddMonitorRequest struct {
+	Name     string            `json:"name" binding:"required"`
+	Type     string            `json:"type" binding:"required,oneof=http https tcp udp dns ping smtp snmp ssl tls"`
+	Address  string            `json:"address" binding:"required"`
+	Port     int32             `json:"port"`
+	Interval int64             `json:"interval"`
+	Metadata map[string]string `json:"metadata"`
+	Enabled  bool              `json:"enabled"`
+
+	// HTTP/HTTPS specific fields
+	HTTPMethod          string            `json:"http_method"`           // GET, POST, PUT, DELETE, etc.
+	HTTPHeaders         map[string]string `json:"http_headers"`          // Custom headers
+	HTTPBody            string            `json:"http_body"`             // Request body
+	ResolvedHost        string            `json:"resolved_host"`         // Custom host resolution
+	FollowRedirects     bool              `json:"follow_redirects"`      // Follow 301/302 redirects
+	MaxRedirects        int               `json:"max_redirects"`         // Maximum redirect depth
+	ExpectedStatusCodes string            `json:"expected_status_codes"` // Comma-separated status codes
+
+	// DNS specific fields
+	DNSServer     string `json:"dns_server"`      // Custom DNS server (e.g., 8.8.8.8:53)
+	DNSServerName string `json:"dns_server_name"` // DNS server name (e.g., "Google DNS")
+	DNSServerType string `json:"dns_server_type"` // DNS protocol: udp, tcp, doh, dot
+
+	// PING specific fields
+	PingCount   int `json:"ping_count"`   // Number of ping packets (default: 4)
+	PingSize    int `json:"ping_size"`    // Size of ping packet in bytes (default: 32)
+	PingTimeout int `json:"ping_timeout"` // Timeout in milliseconds (default: 5000)
+
+	// SMTP specific fields
+	SMTPUsername      string `json:"smtp_username"`       // SMTP authentication username
+	SMTPPassword      string `json:"smtp_password"`       // SMTP authentication password
+	SMTPUseTLS        bool   `json:"smtp_use_tls"`       // Use TLS/SSL (default: false)
+	SMTPMailFrom      string `json:"smtp_mail_from"`     // From address for test
+	SMTPMailTo        string `json:"smtp_mail_to"`       // To address for test
+	SMTPCheckStartTLS bool   `json:"smtp_check_starttls"` // Check STARTTLS support (default: true)
+
+	// SNMP specific fields
+	SNMPCommunity    string `json:"snmp_community"`    // SNMP community string (default: public)
+	SNMPOID          string `json:"snmp_oid"`           // SNMP OID to query
+	SNMPVersion      string `json:"snmp_version"`        // SNMP version: v1, v2c, v3
+	SNMPExpectedValue string `json:"snmp_expected_value"` // Expected value for comparison
+	SNMPOperator     string `json:"snmp_operator"`       // eq, ne, gt, lt, ge, le
+
+	// SSL/TLS specific fields
+	SSLWarnDays    int  `json:"ssl_warn_days"`    // Days before expiration to warn (default: 30)
+	SSLCriticalDays int  `json:"ssl_critical_days"`  // Days before expiration to mark as critical (default: 7)
+	SSLCheckChain  bool `json:"ssl_check_chain"` // Verify certificate chain (default: true)
+}
+
+func (s *Server) addMonitor(c *gin.Context) {
+	var req AddMonitorRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	db := database.GetDB()
+
+	var metadata string
+	if req.Metadata != nil {
+		bytes, err := json.Marshal(req.Metadata)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal metadata"})
+			return
+		}
+		metadata = string(bytes)
+	}
+
+	var httpHeaders string
+	if req.HTTPHeaders != nil {
+		bytes, err := json.Marshal(req.HTTPHeaders)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal http_headers"})
+			return
+		}
+		httpHeaders = string(bytes)
+	}
+
+	target := models.MonitorTarget{
+		Name:     req.Name,
+		Type:     req.Type,
+		Address:  req.Address,
+		Port:     req.Port,
+		Interval: req.Interval,
+		Metadata: metadata,
+		Enabled:  req.Enabled,
+		// HTTP/HTTPS specific fields
+		HTTPMethod:          req.HTTPMethod,
+		HTTPHeaders:         httpHeaders,
+		HTTPBody:            req.HTTPBody,
+		ResolvedHost:        req.ResolvedHost,
+		FollowRedirects:     req.FollowRedirects,
+		MaxRedirects:        req.MaxRedirects,
+		ExpectedStatusCodes: req.ExpectedStatusCodes,
+		// DNS specific fields
+		DNSServer:     req.DNSServer,
+		DNSServerName: req.DNSServerName,
+		DNSServerType: req.DNSServerType,
+		// PING specific fields
+		PingCount:   req.PingCount,
+		PingSize:    req.PingSize,
+		PingTimeout: req.PingTimeout,
+		// SMTP specific fields
+		SMTPUsername:      req.SMTPUsername,
+		SMTPPassword:      req.SMTPPassword,
+		SMTPUseTLS:        req.SMTPUseTLS,
+		SMTPMailFrom:      req.SMTPMailFrom,
+		SMTPMailTo:        req.SMTPMailTo,
+		SMTPCheckStartTLS: req.SMTPCheckStartTLS,
+		// SSL/TLS specific fields
+		SSLWarnDays:    req.SSLWarnDays,
+		SSLCriticalDays: req.SSLCriticalDays,
+		SSLCheckChain:  req.SSLCheckChain,
+	}
+
+	if target.Interval == 0 {
+		target.Interval = 60
+	}
+
+	if err := db.Create(&target).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create monitor"})
+		return
+	}
+
+	// Parse expected status codes
+	var expectedStatusCodes []int
+	if req.ExpectedStatusCodes != "" {
+		codesStr := strings.Split(req.ExpectedStatusCodes, ",")
+		for _, codeStr := range codesStr {
+			codeStr = strings.TrimSpace(codeStr)
+			if codeStr != "" {
+				var code int
+				if _, err := fmt.Sscanf(codeStr, "%d", &code); err == nil {
+					expectedStatusCodes = append(expectedStatusCodes, code)
+				}
+			}
+		}
+	}
+
+	monitorTarget := &monitor.MonitorTarget{
+		ID:       target.ID,
+		Name:     target.Name,
+		Type:     target.Type,
+		Address:  target.Address,
+		Port:     target.Port,
+		Interval: target.Interval,
+		Metadata: req.Metadata,
+		Enabled:  target.Enabled,
+		// HTTP/HTTPS specific fields
+		HTTPMethod:          req.HTTPMethod,
+		HTTPHeaders:         req.HTTPHeaders,
+		HTTPBody:            req.HTTPBody,
+		ResolvedHost:        req.ResolvedHost,
+		FollowRedirects:     req.FollowRedirects,
+		MaxRedirects:        req.MaxRedirects,
+		ExpectedStatusCodes: expectedStatusCodes,
+		// DNS specific fields
+		DNSServer:     req.DNSServer,
+		DNSServerName: req.DNSServerName,
+		DNSServerType: req.DNSServerType,
+		// PING specific fields
+		PingCount:   req.PingCount,
+		PingSize:    req.PingSize,
+		PingTimeout: req.PingTimeout,
+		// SMTP specific fields
+		SMTPUsername:      req.SMTPUsername,
+		SMTPPassword:      req.SMTPPassword,
+		SMTPUseTLS:        req.SMTPUseTLS,
+		SMTPMailFrom:      req.SMTPMailFrom,
+		SMTPMailTo:        req.SMTPMailTo,
+		SMTPCheckStartTLS: req.SMTPCheckStartTLS,
+		// SSL/TLS specific fields
+		SSLWarnDays:    req.SSLWarnDays,
+		SSLCriticalDays: req.SSLCriticalDays,
+		SSLCheckChain:  req.SSLCheckChain,
+	}
+
+	if err := s.monitorService.AddTarget(monitorTarget); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to add monitor"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"id":      target.ID,
+		"message": "Monitor created successfully",
+	})
+}
+
+func (s *Server) listMonitors(c *gin.Context) {
+	db := database.GetDB()
+
+	var targets []models.MonitorTarget
+	if err := db.Find(&targets).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list monitors"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"targets": targets})
+}
+
+func (s *Server) getMonitor(c *gin.Context) {
+	var req IDRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	db := database.GetDB()
+
+	var target models.MonitorTarget
+	if err := db.First(&target, req.ID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Monitor not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, target)
+}
+
+func (s *Server) updateMonitor(c *gin.Context) {
+	var req struct {
+		IDRequest
+		AddMonitorRequest
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	db := database.GetDB()
+
+	var target models.MonitorTarget
+	if err := db.First(&target, req.ID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Monitor not found"})
+		return
+	}
+
+	var metadata string
+	if req.Metadata != nil {
+		bytes, err := json.Marshal(req.Metadata)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal metadata"})
+			return
+		}
+		metadata = string(bytes)
+	}
+
+	var httpHeaders string
+	if req.HTTPHeaders != nil {
+		bytes, err := json.Marshal(req.HTTPHeaders)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal http_headers"})
+			return
+		}
+		httpHeaders = string(bytes)
+	}
+
+	target.Name = req.Name
+	target.Type = req.Type
+	target.Address = req.Address
+	target.Port = req.Port
+	target.Interval = req.Interval
+	target.Metadata = metadata
+	target.Enabled = req.Enabled
+	// HTTP/HTTPS specific fields
+	target.HTTPMethod = req.HTTPMethod
+	target.HTTPHeaders = httpHeaders
+	target.HTTPBody = req.HTTPBody
+	target.ResolvedHost = req.ResolvedHost
+	target.FollowRedirects = req.FollowRedirects
+	target.MaxRedirects = req.MaxRedirects
+	target.ExpectedStatusCodes = req.ExpectedStatusCodes
+	// DNS specific fields
+	target.DNSServer =     req.DNSServer
+	target.DNSServerName = req.DNSServerName
+	target.DNSServerType = req.DNSServerType
+	// PING specific fields
+	target.PingCount =   req.PingCount
+	target.PingSize =    req.PingSize
+	target.PingTimeout = req.PingTimeout
+	// SMTP specific fields
+	target.SMTPUsername =      req.SMTPUsername
+	target.SMTPPassword =      req.SMTPPassword
+	target.SMTPUseTLS =        req.SMTPUseTLS
+	target.SMTPMailFrom =      req.SMTPMailFrom
+	target.SMTPMailTo =        req.SMTPMailTo
+	target.SMTPCheckStartTLS = req.SMTPCheckStartTLS
+	// SSL/TLS specific fields
+	target.SSLWarnDays =     req.SSLWarnDays
+	target.SSLCriticalDays = req.SSLCriticalDays
+	target.SSLCheckChain =  req.SSLCheckChain
+
+	if err := db.Save(&target).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update monitor"})
+		return
+	}
+
+	if err := s.monitorService.RemoveTarget(target.ID); err == nil {
+		monitorTarget := &monitor.MonitorTarget{
+			ID:       target.ID,
+			Name:     target.Name,
+			Type:     target.Type,
+			Address:  target.Address,
+			Port:     target.Port,
+			Interval: target.Interval,
+			Metadata: req.Metadata,
+			Enabled:  target.Enabled,
+			// HTTP/HTTPS specific fields
+			HTTPMethod:   req.HTTPMethod,
+			HTTPHeaders:  req.HTTPHeaders,
+			HTTPBody:     req.HTTPBody,
+			ResolvedHost: req.ResolvedHost,
+			// DNS specific fields
+			DNSServer:     req.DNSServer,
+			DNSServerName: req.DNSServerName,
+			DNSServerType: req.DNSServerType,
+			// PING specific fields
+			PingCount:   req.PingCount,
+			PingSize:    req.PingSize,
+			PingTimeout: req.PingTimeout,
+			// SMTP specific fields
+			SMTPUsername:      req.SMTPUsername,
+			SMTPPassword:      req.SMTPPassword,
+			SMTPUseTLS:        req.SMTPUseTLS,
+			SMTPMailFrom:      req.SMTPMailFrom,
+			SMTPMailTo:        req.SMTPMailTo,
+			SMTPCheckStartTLS: req.SMTPCheckStartTLS,
+		}
+		s.monitorService.AddTarget(monitorTarget)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Monitor updated successfully"})
+}
+
+func (s *Server) removeMonitor(c *gin.Context) {
+	var req IDRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	db := database.GetDB()
+
+	if err := db.Delete(&models.MonitorTarget{}, req.ID).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete monitor"})
+		return
+	}
+
+	s.monitorService.RemoveTarget(req.ID)
+
+	c.JSON(http.StatusOK, gin.H{"message": "Monitor deleted successfully"})
+}
+
+func (s *Server) getMonitorStatus(c *gin.Context) {
+	var req IDRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	status, err := s.monitorService.GetStatus(req.ID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Status not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, status)
+}
+
+func (s *Server) listMonitorStatus(c *gin.Context) {
+	statuses := s.monitorService.ListStatus()
+	c.JSON(http.StatusOK, gin.H{"statuses": statuses})
+}
+
+type IPGeoRequest struct {
+	IP string `json:"ip" binding:"required"`
+}
+
+func (s *Server) queryIPGeo(c *gin.Context) {
+	var req IPGeoRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	result, err := s.ipgeoService.QueryIP(req.IP)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to query IP geolocation"})
+		return
+	}
+
+	c.JSON(http.StatusOK, result)
+}
+
+func (s *Server) healthCheck(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "healthy"})
+}
+
+func (s *Server) indexPage(c *gin.Context) {
+	c.HTML(http.StatusOK, "index.html", nil)
+}
+
+// 日志查询相关的 API
+type LogSearchRequest struct {
+	TargetID   *uint32 `json:"target_id,omitempty"`
+	Status     string  `json:"status,omitempty"`
+	StartTime  *int64  `json:"start_time,omitempty"`  // Unix timestamp
+	EndTime    *int64  `json:"end_time,omitempty"`    // Unix timestamp
+	Size       int     `json:"size,omitempty"`
+	From       int     `json:"from,omitempty"`
+	QueryText  string  `json:"query_text,omitempty"`
+}
+
+func (s *Server) searchLogs(c *gin.Context) {
+	if s.es == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Elasticsearch is not enabled"})
+		return
+	}
+
+	var req LogSearchRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 构建查询
+	query := &elasticsearch.SearchQuery{
+		TargetID:  req.TargetID,
+		Status:    req.Status,
+		Size:      req.Size,
+		From:      req.From,
+		QueryText: req.QueryText,
+	}
+
+	// 转换时间
+	if req.StartTime != nil {
+		t := time.Unix(*req.StartTime, 0)
+		query.StartTime = &t
+	}
+	if req.EndTime != nil {
+		t := time.Unix(*req.EndTime, 0)
+		query.EndTime = &t
+	}
+
+	// 执行搜索
+	result, err := s.es.SearchLogs(query)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"total": result.Total,
+		"hits":  result.Hits,
+	})
+}
+
+type LogStatsRequest struct {
+	TargetID  uint32 `json:"target_id" binding:"required"`
+	StartTime int64  `json:"start_time"`  // Unix timestamp
+	EndTime   int64  `json:"end_time"`    // Unix timestamp
+}
+
+func (s *Server) getLogStats(c *gin.Context) {
+	if s.es == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Elasticsearch is not enabled"})
+		return
+	}
+
+	var req LogStatsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 转换时间（默认最近24小时）
+	startTime := time.Unix(req.StartTime, 0)
+	if req.StartTime == 0 {
+		startTime = time.Now().Add(-24 * time.Hour)
+	}
+
+	endTime := time.Unix(req.EndTime, 0)
+	if req.EndTime == 0 {
+		endTime = time.Now()
+	}
+
+	// 获取统计
+	stats, err := s.es.GetLogStats(req.TargetID, startTime, endTime)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, stats)
+}
+
+func (s *Server) Run(addr string) error {
+	return s.router.Run(addr)
+}
+
+// DNS Provider management
+
+type DNSProviderRequest struct {
+	Name       string `json:"name" binding:"required"`       // Provider name
+	Server     string `json:"server" binding:"required"`     // DNS server address
+	ServerType string `json:"server_type" binding:"required"` // DNS protocol: udp, tcp, doh, dot
+	IsDefault  bool   `json:"is_default"`                    // Mark as default
+}
+
+func (s *Server) addDNSProvider(c *gin.Context) {
+	var req DNSProviderRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	db := database.GetDB()
+
+	// If setting as default, unset other defaults
+	if req.IsDefault {
+		db.Model(&models.DNSProvider{}).Where("is_default = ?", true).Update("is_default", false)
+	}
+
+	provider := models.DNSProvider{
+		Name:       req.Name,
+		Server:     req.Server,
+		ServerType: req.ServerType,
+		IsDefault:  req.IsDefault,
+	}
+
+	if err := db.Create(&provider).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create DNS provider"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"id":      provider.ID,
+		"message": "DNS provider created successfully",
+	})
+}
+
+func (s *Server) listDNSProviders(c *gin.Context) {
+	db := database.GetDB()
+
+	var providers []models.DNSProvider
+	if err := db.Find(&providers).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list DNS providers"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"providers": providers})
+}
+
+func (s *Server) getDNSProvider(c *gin.Context) {
+	var req IDRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	db := database.GetDB()
+
+	var provider models.DNSProvider
+	if err := db.First(&provider, req.ID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "DNS provider not found"})
+		return
+	}
+
+	c.JSON(http.StatusOK, provider)
+}
+
+func (s *Server) updateDNSProvider(c *gin.Context) {
+	var req struct {
+		IDRequest
+		DNSProviderRequest
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	db := database.GetDB()
+
+	var provider models.DNSProvider
+	if err := db.First(&provider, req.ID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "DNS provider not found"})
+		return
+	}
+
+	// If setting as default, unset other defaults
+	if req.IsDefault {
+		db.Model(&models.DNSProvider{}).Where("is_default = ? AND id != ?", true, req.ID).Update("is_default", false)
+	}
+
+	provider.Name = req.Name
+	provider.Server = req.Server
+	provider.ServerType = req.ServerType
+	provider.IsDefault = req.IsDefault
+
+	if err := db.Save(&provider).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update DNS provider"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "DNS provider updated successfully"})
+}
+
+func (s *Server) removeDNSProvider(c *gin.Context) {
+	var req IDRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	db := database.GetDB()
+
+	if err := db.Delete(&models.DNSProvider{}, req.ID).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete DNS provider"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "DNS provider deleted successfully"})
+}
+// Alert Channel API handlers
+
+func (s *Server) addAlertChannel(c *gin.Context) {
+	var req struct {
+		Name    string `json:"name" binding:"required"`
+		Type    string `json:"type" binding:"required"`
+		Enabled bool   `json:"enabled"`
+		Config  string `json:"config" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	channel := models.AlertChannel{
+		Name:    req.Name,
+		Type:    req.Type,
+		Enabled: req.Enabled,
+		Config:  req.Config,
+	}
+
+	db := database.GetDB()
+	if err := db.Create(&channel).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create alert channel"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"id": channel.ID, "message": "Alert channel created successfully"})
+}
+
+func (s *Server) listAlertChannels(c *gin.Context) {
+	db := database.GetDB()
+	var channels []models.AlertChannel
+	if err := db.Find(&channels).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list alert channels"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"channels": channels})
+}
+
+func (s *Server) getAlertChannel(c *gin.Context) {
+	var req IDRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	db := database.GetDB()
+	var channel models.AlertChannel
+	if err := db.First(&channel, req.ID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Alert channel not found"})
+		return
+	}
+	c.JSON(http.StatusOK, channel)
+}
+
+func (s *Server) updateAlertChannel(c *gin.Context) {
+	var req struct {
+		IDRequest
+		Name    string `json:"name" binding:"required"`
+		Type    string `json:"type" binding:"required"`
+		Enabled bool   `json:"enabled"`
+		Config  string `json:"config" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	db := database.GetDB()
+	var channel models.AlertChannel
+	if err := db.First(&channel, req.ID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Alert channel not found"})
+		return
+	}
+
+	channel.Name = req.Name
+	channel.Type = req.Type
+	channel.Enabled = req.Enabled
+	channel.Config = req.Config
+
+	if err := db.Save(&channel).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update alert channel"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Alert channel updated successfully"})
+}
+
+func (s *Server) removeAlertChannel(c *gin.Context) {
+	var req IDRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	db := database.GetDB()
+	if err := db.Delete(&models.AlertChannel{}, req.ID).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete alert channel"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Alert channel deleted successfully"})
+}
+
+func (s *Server) testAlertChannel(c *gin.Context) {
+	var req IDRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := s.alertService.TestAlertChannel(uint(req.ID)); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to send test alert"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Test alert sent successfully"})
+}
+
+// Alert Rule API handlers
+
+func (s *Server) addAlertRule(c *gin.Context) {
+	var req struct {
+		TargetID       uint32 `json:"target_id" binding:"required"`
+		ChannelID      uint   `json:"channel_id" binding:"required"`
+		ThresholdType  string `json:"threshold_type" binding:"required"`
+		ThresholdValue int    `json:"threshold_value" binding:"required"`
+		Enabled        bool   `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	rule := models.AlertRule{
+		TargetID:       req.TargetID,
+		ChannelID:      req.ChannelID,
+		ThresholdType:  req.ThresholdType,
+		ThresholdValue: req.ThresholdValue,
+		Enabled:        req.Enabled,
+	}
+
+	db := database.GetDB()
+	if err := db.Create(&rule).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create alert rule"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"id": rule.ID, "message": "Alert rule created successfully"})
+}
+
+func (s *Server) listAlertRules(c *gin.Context) {
+	db := database.GetDB()
+	var rules []models.AlertRule
+	if err := db.Find(&rules).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list alert rules"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"rules": rules})
+}
+
+func (s *Server) getAlertRule(c *gin.Context) {
+	var req IDRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	db := database.GetDB()
+	var rule models.AlertRule
+	if err := db.First(&rule, req.ID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Alert rule not found"})
+		return
+	}
+	c.JSON(http.StatusOK, rule)
+}
+
+func (s *Server) updateAlertRule(c *gin.Context) {
+	var req struct {
+		IDRequest
+		TargetID       uint32 `json:"target_id" binding:"required"`
+		ChannelID      uint   `json:"channel_id" binding:"required"`
+		ThresholdType  string `json:"threshold_type" binding:"required"`
+		ThresholdValue int    `json:"threshold_value" binding:"required"`
+		Enabled        bool   `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	db := database.GetDB()
+	var rule models.AlertRule
+	if err := db.First(&rule, req.ID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Alert rule not found"})
+		return
+	}
+
+	rule.TargetID = req.TargetID
+	rule.ChannelID = req.ChannelID
+	rule.ThresholdType = req.ThresholdType
+	rule.ThresholdValue = req.ThresholdValue
+	rule.Enabled = req.Enabled
+
+	if err := db.Save(&rule).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update alert rule"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Alert rule updated successfully"})
+}
+
+func (s *Server) removeAlertRule(c *gin.Context) {
+	var req IDRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	db := database.GetDB()
+	if err := db.Delete(&models.AlertRule{}, req.ID).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete alert rule"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Alert rule deleted successfully"})
+}
+
+func (s *Server) listAlertRulesByTarget(c *gin.Context) {
+	var req struct {
+		TargetID uint32 `json:"target_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	rules, err := s.alertService.ListAlertRulesByTarget(req.TargetID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list alert rules"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"rules": rules})
+}
+
+// Configuration management handlers
+
+// getConfig returns the current configuration (without sensitive data)
+func (s *Server) getConfig(c *gin.Context) {
+	// Return config without password for security
+	safeConfig := map[string]interface{}{
+		"server": s.config.Server,
+		"database": map[string]interface{}{
+			"driver":  s.config.Database.Driver,
+			"host":    s.config.Database.Host,
+			"port":    s.config.Database.Port,
+			"user":    s.config.Database.User,
+			"dbname":  s.config.Database.DBName,
+			"sslmode": s.config.Database.SSLMode,
+		},
+		"monitor":      s.config.Monitor,
+		"logger":       s.config.Logger,
+		"elasticsearch": s.config.Elasticsearch,
+		"alert":        s.config.Alert,
+		"snmp":         s.config.SNMP,
+	}
+
+	c.JSON(http.StatusOK, safeConfig)
+}
+
+// updateConfig updates the configuration and saves to file
+func (s *Server) updateConfig(c *gin.Context) {
+	var req struct {
+		Server        *config.ServerConfig        `json:"server"`
+		Database      *config.DatabaseConfig      `json:"database"`
+		Monitor       *config.MonitorConfig       `json:"monitor"`
+		Logger        *config.LoggerConfig        `json:"logger"`
+		Elasticsearch *config.ElasticsearchConfig `json:"elasticsearch"`
+		Alert         *config.AlertConfig         `json:"alert"`
+		SNMP          *config.SNMPConfig          `json:"snmp"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Update configuration sections that are provided
+	if req.Server != nil {
+		s.config.Server = *req.Server
+	}
+	if req.Database != nil {
+		s.config.Database = *req.Database
+	}
+	if req.Monitor != nil {
+		s.config.Monitor = *req.Monitor
+	}
+	if req.Logger != nil {
+		s.config.Logger = *req.Logger
+	}
+	if req.Elasticsearch != nil {
+		s.config.Elasticsearch = *req.Elasticsearch
+	}
+	if req.Alert != nil {
+		s.config.Alert = *req.Alert
+	}
+	if req.SNMP != nil {
+		s.config.SNMP = *req.SNMP
+	}
+
+	// Save to file
+	if err := config.SaveToFile(s.configPath, s.config); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to save configuration: %v", err)})
+		return
+	}
+
+	// Note: Database and Elasticsearch changes require service restart
+	needsRestart := false
+	if req.Database != nil {
+		needsRestart = true
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":      "Configuration updated successfully",
+		"needs_restart": needsRestart,
+	})
+}
+
+	var req struct {
+		Driver   string `json:"driver" binding:"required"`
+		Host     string `json:"host" binding:"required"`
+		Port     int    `json:"port" binding:"required"`
+		User     string `json:"user" binding:"required"`
+		Password string `json:"password"`
+		DBName   string `json:"dbname" binding:"required"`
+		SSLMode  string `json:"sslmode"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Database configuration is valid",
+		"driver":  req.Driver,
+		"host":    req.Host,
+		"port":    req.Port,
+		"dbname":  req.DBName,
+	})
+}

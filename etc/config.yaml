@@ -1,0 +1,42 @@
+# Monitor 服务配置文件
+
+server:
+  http_port: 8080
+  grpc_port: 9090
+  host: 0.0.0.0
+
+database:
+  driver: sqlite
+  host: localhost
+  port: 3306
+  user: root
+  password: ""
+  dbname: monitor.db
+  sslmode: disable
+
+monitor:
+  check_interval: 60  # 监控检查间隔（秒）
+  workers: 10         # 监控工作线程数
+
+logger:
+  level: info         # 日志级别: debug, info, warn, error
+  output: stdout      # 输出目标: stdout, stderr, 或文件路径
+
+elasticsearch:
+  enabled: false              # 是否启用 Elasticsearch (保存原始请求/响应包)
+  addresses:
+    - http://localhost:9200   # ES 节点地址列表
+  username: ""                # ES 用户名（如果需要认证）
+  password: ""                # ES 密码
+  index_prefix: "monitor-logs" # 索引前缀（按日期滚动，如 monitor-logs-2025.01.11）
+
+alert:
+  enabled: true               # 是否启用告警
+  cooldown_seconds: 300       # 告警冷却时间（秒），同一目标在冷却时间内不会重复告警
+  retry_times: 3              # 告警失败重试次数
+  retry_interval: 60          # 重试间隔（秒）
+
+snmp:
+  default_community: "public" # 默认 SNMP community string
+  default_version: "v2c"      # 默认 SNMP version: v1, v2c, v3
+  default_timeout: 5000       # 默认超时时间（毫秒）

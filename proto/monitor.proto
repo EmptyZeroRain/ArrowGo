@@ -1,0 +1,71 @@
+syntax = "proto3";
+
+package monitor;
+
+option go_package = "./proto";
+
+service MonitorService {
+  rpc AddMonitor(Target) returns (MonitorResponse);
+  rpc RemoveMonitor(MonitorID) returns (MonitorResponse);
+  rpc GetMonitor(MonitorID) returns (Target);
+  rpc ListMonitors(Empty) returns (TargetList);
+  rpc GetMonitorStatus(MonitorID) returns (MonitorStatus);
+  rpc ListMonitorStatus(Empty) returns (MonitorStatusList);
+}
+
+service IPGeoService {
+  rpc QueryIPGeo(IPRequest) returns (IPGeoResponse);
+}
+
+message Target {
+  uint32 id = 1;
+  string name = 2;
+  string type = 3; // http, https, tcp, udp, dns
+  string address = 4;
+  int32 port = 5;
+  int64 interval = 6; // check interval in seconds
+  map<string, string> metadata = 7;
+  bool enabled = 8;
+}
+
+message MonitorID {
+  uint32 id = 1;
+}
+
+message MonitorResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message Empty {}
+
+message TargetList {
+  repeated Target targets = 1;
+}
+
+message MonitorStatus {
+  uint32 id = 1;
+  string status = 2; // up, down, unknown
+  int64 response_time = 3; // milliseconds
+  string message = 4;
+  int64 checked_at = 5;
+  int32 uptime_percentage = 6;
+}
+
+message MonitorStatusList {
+  repeated MonitorStatus statuses = 1;
+}
+
+message IPRequest {
+  string ip = 1;
+}
+
+message IPGeoResponse {
+  string ip = 1;
+  string country = 2;
+  string region = 3;
+  string city = 4;
+  string isp = 5;
+  double latitude = 6;
+  double longitude = 7;
+}

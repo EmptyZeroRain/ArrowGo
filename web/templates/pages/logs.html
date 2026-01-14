@@ -1,0 +1,158 @@
+{{ template "base" . }}
+
+{{ define "content" }}
+    <style>
+        /* Log Search Styles */
+        .log-search-form {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+            padding: 20px;
+            background: #f9fafb;
+            border-radius: 8px;
+        }
+
+        .log-filters {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 10px;
+            margin-bottom: 15px;
+        }
+
+        .log-results {
+            max-height: 600px;
+            overflow-y: auto;
+        }
+
+        .log-entry {
+            background: white;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 10px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .log-entry:hover {
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+
+        .log-entry-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+        }
+
+        .log-entry-details {
+            display: none;
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid #e5e7eb;
+        }
+
+        .log-entry.expanded .log-entry-details {
+            display: block;
+        }
+
+        .log-json {
+            background: #1f2937;
+            color: #10b981;
+            padding: 15px;
+            border-radius: 6px;
+            overflow-x: auto;
+            font-family: 'Monaco', 'Menlo', monospace;
+            font-size: 13px;
+            max-height: 400px;
+            overflow-y: auto;
+        }
+
+        .status-badge.log-up {
+            background: #d1fae5;
+            color: #065f46;
+        }
+
+        .status-badge.log-down {
+            background: #fee2e2;
+            color: #991b1b;
+        }
+    </style>
+
+    <div class="logs-section">
+        <h2>日志查询 <small style="font-size: 14px; color: #6b7280; font-weight: normal;">(需要启用 Elasticsearch)</small></h2>
+
+        <div class="log-search-form">
+            <div class="form-group">
+                <label for="log-target">监控目标</label>
+                <select id="log-target">
+                    <option value="">全部目标</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="log-status">状态</label>
+                <select id="log-status">
+                    <option value="">全部</option>
+                    <option value="up">在线</option>
+                    <option value="down">离线</option>
+                </select>
+            </div>
+
+            <div class="form-group">
+                <label for="log-query">关键词搜索</label>
+                <input type="text" id="log-query" placeholder="搜索请求/响应内容">
+            </div>
+
+            <div class="form-group">
+                <label for="log-size">每页数量</label>
+                <select id="log-size">
+                    <option value="10">10 条</option>
+                    <option value="20" selected>20 条</option>
+                    <option value="50">50 条</option>
+                    <option value="100">100 条</option>
+                </select>
+            </div>
+
+            <div class="form-group" style="display: flex; align-items: flex-end;">
+                <button class="btn btn-primary" onclick="searchLogs()" style="width: 100%;">
+                    <i class="fas fa-search"></i> 搜索
+                </button>
+            </div>
+        </div>
+
+        <div id="log-results" class="log-results">
+            <div style="text-align: center; padding: 40px; color: #6b7280;">
+                <i class="fas fa-search" style="font-size: 48px; margin-bottom: 10px;"></i>
+                <p>输入搜索条件并点击搜索按钮</p>
+            </div>
+        </div>
+
+        <div id="log-pagination" style="display: none; margin-top: 20px; text-align: center;">
+            <button class="btn btn-secondary" onclick="loadLogs('prev')">
+                <i class="fas fa-chevron-left"></i> 上一页
+            </button>
+            <span id="log-page-info" style="margin: 0 15px;"></span>
+            <button class="btn btn-secondary" onclick="loadLogs('next')">
+                下一页 <i class="fas fa-chevron-right"></i>
+            </button>
+        </div>
+    </div>
+{{ end }}
+
+{{ define "modals" }}
+    <!-- Log Detail Modal -->
+    <div id="log-modal" class="modal">
+        <div class="modal-content" style="max-width: 800px;">
+            <div class="modal-header">
+                <h2>日志详情</h2>
+                <button class="close-btn" onclick="closeLogModal()">&times;</button>
+            </div>
+            <div id="log-modal-content"></div>
+        </div>
+    </div>
+{{ end }}
+
+{{ define "scripts" }}
+    <script src="/static/js/logs.js"></script>
+{{ end }}
